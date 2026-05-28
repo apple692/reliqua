@@ -1,0 +1,198 @@
+"""Tests for the miner HTTP submitter."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from reliquary.constants import VALIDATOR_HTTP_PORT
+from reliquary.miner.submitter import (
+    NoValidatorFoundError,
+    SubmissionError,
+    discover_validator_url,
+    get_window_state_v2,
+    submit_batch_v2,
+)
+from reliquary.protocol.submission import (
+    BatchSubmissionRequest,
+    BatchSubmissionResponse,
+    GrpoBatchState,
+    RejectReason,
+    RolloutSubmission,
+    WindowState,
+)
+
+
+# --------------------- discover_validator_url ---------------------
+
+
+def test_discover_picks_first_permitted_with_routable_axon() -> None:
+    meta = SimpleNamespace(
+        validator_permit=[False, True, True],
+        axons=[
+            SimpleNamespace(ip="1.1.1.1", port=8888),
+            SimpleNamespace(ip="2.2.2.2", port=9000),
+            SimpleNamespace(ip="3.3.3.3", port=9001),
+        ],
+    )
+    assert discover_validator_url(meta) == "http://2.2.2.2:9000"
+
+
+def test_discover_skips_unset_axon_ip() -> None:
+    meta = SimpleNamespace(
+        validator_permit=[True, True],
+        axons=[
+            SimpleNamespace(ip="0.0.0.0", port=8888),
+            SimpleNamespace(ip="2.2.2.2", port=8888),
+        ],
+    )
+    assert discover_validator_url(meta) == "http://2.2.2.2:8888"
+
+
+def test_discover_falls_back_to_default_port_when_axon_port_zero() -> None:
+    meta = SimpleNamespace(
+        validator_permit=[True],
+        axons=[SimpleNamespace(ip="1.1.1.1", port=0)],
+    )
+    assert discover_validator_url(meta) == f"http://1.1.1.1:{VALIDATOR_HTTP_PORT}"
+
+
+def test_discover_raises_when_no_permitted() -> None:
+    meta = SimpleNamespace(
+        validator_permit=[False, False],
+        axons=[
+            SimpleNamespace(ip="1.1.1.1", port=8888),
+            SimpleNamespace(ip="2.2.2.2", port=8888),
+        ],
+    )
+    with pytest.raises(NoValidatorFoundError):
+        discover_validator_url(meta)
+
+
+def test_discover_raises_when_metagraph_malformed() -> None:
+    with pytest.raises(NoValidatorFoundError):
+        discover_validator_url(SimpleNamespace())
+
+
+# ---- v2 submitter tests ----
+
+
+def _rollouts(k=4):
+    out = []
+    for i in range(8):
+        out.append(
+            RolloutSubmission(
+                tokens=[1, 2, 3],
+                reward=1.0 if i < k else 0.0,
+                commit={"tokens": [1, 2, 3], "proof_version": "v5"},
+            )
+        )
+    return out
+
+
+def _v2_request():
+    return BatchSubmissionRequest(
+        miner_hotkey="hk",
+        prompt_idx=42,
+        window_start=100,
+        merkle_root="00" * 32,
+        rollouts=_rollouts(),
+        checkpoint_hash="sha256:test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_ok(monkeypatch):
+    responses = [
+        httpx.Response(
+            200,
+            json=BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.ACCEPTED
+            ).model_dump(mode="json"),
+        )
+    ]
+
+    async def _post(self, url, json=None, timeout=None):
+        return responses.pop(0)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_reject_reason_propagated(monkeypatch):
+    async def _post(self, url, json=None, timeout=None):
+        return httpx.Response(
+            200,
+            json=BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.PROMPT_IN_COOLDOWN
+            ).model_dump(mode="json"),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_IN_COOLDOWN
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_window_state_v2(monkeypatch):
+    state = GrpoBatchState(
+        state=WindowState.OPEN,
+        window_n=100,
+        anchor_block=1000,
+        cooldown_prompts=[42, 7],
+        valid_submissions=3,
+        checkpoint_n=0,
+    )
+
+    async def _get(self, url, timeout=None):
+        return httpx.Response(200, json=state.model_dump(mode="json"))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    client = httpx.AsyncClient()
+    s = await get_window_state_v2("http://fake", client=client)
+    assert s.window_n == 100
+    assert set(s.cooldown_prompts) == {42, 7}
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_503_maps_to_window_not_active(monkeypatch):
+    """HTTP 503 from /submit short-circuits to WINDOW_NOT_ACTIVE (no retry)."""
+    call_count = {"n": 0}
+
+    async def _post(self, url, json=None, timeout=None):
+        call_count["n"] += 1
+        return httpx.Response(503, json={"detail": "no_active_window"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.WINDOW_NOT_ACTIVE
+    # Crucially: no retries. One call, not three.
+    assert call_count["n"] == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_409_maps_to_window_mismatch(monkeypatch):
+    async def _post(self, url, json=None, timeout=None):
+        return httpx.Response(409, json={"detail": "window_mismatch"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.WINDOW_MISMATCH
+    await client.aclose()
