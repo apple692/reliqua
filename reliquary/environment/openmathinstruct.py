@@ -11,7 +11,8 @@ Disk-efficient strategy: only downloads the first N shards by default
 Usage:
     env = OpenMathInstructEnvironment()
     p = env.get_problem(42)
-    # {"prompt": "...", "ground_truth": "45", "id": "abc1234..."}
+    # {"prompt": "...", "ground_truth": "45", "generated_solution": "...",
+    #  "id": "abc1234..."}
     reward = env.compute_reward(p, "the answer is \\boxed{45}")  # → 1.0
 """
 
@@ -142,6 +143,7 @@ class OpenMathInstructEnvironment:
 
     _dataset_cache: ClassVar[Optional[object]] = None
     _DEFAULT_SHARDS: ClassVar[int] = 2
+    _solution_token_len_cache: ClassVar[dict[tuple[int, str], int]] = {}
 
     def __init__(self) -> None:
         if OpenMathInstructEnvironment._dataset_cache is None:
@@ -166,6 +168,20 @@ class OpenMathInstructEnvironment:
     def __len__(self) -> int:
         return len(self._dataset)
 
+    def get_generated_solution_token_length(self, index: int, tokenizer) -> int:
+        """Token length of the dataset's ``generated_solution`` (cached per row/tokenizer)."""
+        idx = index % len(self._dataset)
+        tok_key = str(getattr(tokenizer, "name_or_path", None) or id(tokenizer))
+        cache_key = (idx, tok_key)
+        cached = OpenMathInstructEnvironment._solution_token_len_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        row = self._dataset[idx]
+        sol = str(row.get("generated_solution", "") or "")
+        n = len(tokenizer.encode(sol, add_special_tokens=False))
+        OpenMathInstructEnvironment._solution_token_len_cache[cache_key] = n
+        return n
+
     def get_problem(self, index: int) -> dict:
         """Deterministic lookup with modulo wrap.
 
@@ -177,10 +193,12 @@ class OpenMathInstructEnvironment:
         row = self._dataset[idx]
         question: str = row["problem"]
         expected: str = str(row.get("expected_answer", ""))
+        generated_solution: str = str(row.get("generated_solution", "") or "")
         problem_id = hashlib.sha256(question.encode()).hexdigest()[:16]
         return {
             "prompt": question,
             "ground_truth": expected,
+            "generated_solution": generated_solution,
             "id": problem_id,
         }
 

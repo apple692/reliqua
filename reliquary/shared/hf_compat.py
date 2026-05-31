@@ -80,3 +80,29 @@ def resolve_max_context_length(model_config: PretrainedConfig | Any) -> int:
             pass
 
     return 16384
+
+
+def resolve_attn_implementation() -> str:
+    """Return an attention backend that can load in the current environment.
+
+    Honors ``GRAIL_ATTN_IMPL`` (default ``flash_attention_2``). When flash-attn
+    is requested but not importable, falls back to ``sdpa`` so the miner can
+    boot — mainnet GRAIL still requires ``flash_attention_2`` matching the
+    validator stack.
+    """
+    import logging
+    import os
+
+    requested = os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
+    if requested.startswith("flash_attention"):
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                "flash-attn is not installed but GRAIL_ATTN_IMPL=%r — "
+                "falling back to sdpa. Install flash-attn for mainnet mining "
+                "(GRAIL proofs are bit-sensitive to the attention kernel).",
+                requested,
+            )
+            return "sdpa"
+    return requested

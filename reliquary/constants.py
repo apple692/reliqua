@@ -86,12 +86,22 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
-# Cap/non-EOS truncation budget per submission. This is an acceptance-time
-# policy: cap hits still run through GRAIL/logprob/distribution/boxed checks,
-# and the training quarantine below separately decides whether the selected
-# window is healthy enough to mutate the model.
-MAX_TRUNCATED_PER_SUBMISSION = 5
-BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 5
+# Cap/non-EOS truncation budget per submission. A single missing-EOS rollout
+# can be an honest local max-token accident; repeated missing-EOS rollouts in
+# one GRPO group are a sampling policy, not a rare exception, and have become
+# the main manufactured-loser path.
+MAX_TRUNCATED_PER_SUBMISSION = 1
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
+
+# Group-level reward-shape guard. The live attack manufactures binary reward
+# vectors such as 11110000 while cutting every zero-reward rollout to the same
+# local cap (120/150/4500 tokens). Exact repeated loser lengths are vanishingly
+# unlikely under natural sampling, especially when they occupy the ordered
+# suffix of the reward vector.
+REWARD_SHAPE_ZERO_MODE_MIN_LENGTH = 64
+REWARD_SHAPE_ZERO_MODE_MIN_SHARE = 0.75
+REWARD_SHAPE_MIN_REPEATED_ZERO_ROLLOUTS = 2
+REWARD_SHAPE_MIN_EXACT_ZERO_ROLLOUTS = 3
 
 # Training quarantine policy. Quarantine is intentionally conservative: it
 # skips train_step for windows whose selected batch has high-confidence poison
@@ -106,6 +116,8 @@ TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 7000
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS = 4
 TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS = 3
 TRAINING_QUARANTINE_REJECT_SPIKE_MIN = 32
+TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS = 2
+TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH = 2048
 
 # Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
 # window. Beyond this, ``reject_counts`` still increments but no metadata is
@@ -124,6 +136,13 @@ VALIDATOR_HTTP_PORT = 8888
 # rejected spam free and keep the validator's GPU queue saturated.
 MAX_PROOF_CANDIDATES_PER_WINDOW = 32
 
+# A hotkey that repeatedly reaches the expensive proof path and then fails
+# behavioural/integrity checks should not be allowed to consume the whole
+# window's scarce proof budget. Allow a small number of misses for honest
+# stack drift, then reject further proof admissions from that hotkey until the
+# next window.
+MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
+
 # After the B-th distinct prompt records a seal-trigger drand round, admit only
 # a small tail of same-round stragglers. The hard window cap above remains the
 # outer bound; this cap protects the boundary fair-split extension from turning
@@ -135,6 +154,21 @@ MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
 # admitted trigger-round candidates to finish GRAIL; after this timeout it seals
 # anyway so a slow or constantly refilled queue cannot freeze checkpoints.
 MAX_SEAL_QUEUE_DRAIN_SECONDS = 20.0
+
+# Liveness poll interval while an OPEN validator window waits for either a
+# normal seal trigger or an exhausted proof-admission queue. This prevents a
+# window from waiting WINDOW_TIMEOUT_SECONDS after all admitted proof work has
+# drained but fewer than B valid submissions survived validation.
+PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
+
+# Sparse-window liveness breaker. After recent validator hardening, honest but
+# stale/misconfigured miners can leave a window with some valid submissions but
+# fewer than B distinct trainable prompts. Keep the normal 8-distinct seal as
+# the happy path, but do not let sparse valid traffic hold checkpoint progress
+# for the long safety-net timeout.
+SPARSE_VALID_IDLE_SEAL_SECONDS = 180.0
+SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
+SPARSE_VALID_MAX_WINDOW_SECONDS = 600.0
 
 # Active environment name (resolved by reliquary.environment.load_environment).
 ENVIRONMENT_NAME = "openmathinstruct"
@@ -210,6 +244,26 @@ DATASET_SPLIT = "train"
 # tight to carry meaningful GRPO signal.
 SIGMA_MIN = 0.43
 BOOTSTRAP_SIGMA_MIN = 0.33
+
+# Soft token target shown in the generation-only instruction block (advisory).
+MINER_GENERATION_SOFT_TARGET_TOKENS = 512
+
+# Wrap the env question in the tokenizer chat template during generation only.
+# Submitted rollouts still use the bare canonical env prompt tokens.
+MINER_USE_CHAT_TEMPLATE = True
+
+# Extra vLLM context beyond MAX_NEW_TOKENS_PROTOCOL_CAP so an augmented/chat
+# generation prefix can still produce (8192 − canonical_len) completion tokens.
+# Required: augmented_len + (8192 − canonical_len) = 8192 + (augmented − canonical).
+MINER_GENERATION_MAX_MODEL_LEN_OVERHEAD = 256
+
+# Instruction block appended to the user turn (plain suffix or chat user content).
+# ``{soft_target}`` is advisory only; vLLM ``max_tokens`` uses canonical room.
+MINER_GENERATION_PROMPT_SUFFIX_TEMPLATE = (
+    "\n\nSolve step-by-step, then put your final answer on its own line as "
+    "\\boxed{{your answer}}. Keep your entire response under {soft_target} tokens. "
+    "After the \\boxed{{}} line, end your message immediately."
+)
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8

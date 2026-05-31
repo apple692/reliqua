@@ -3,7 +3,11 @@
 import random
 import pytest
 
-from reliquary.miner.engine import pick_prompt_idx
+from reliquary.miner.engine import (
+    eos_set_from_model,
+    pick_prompt_idx,
+    truncate_completion_at_eos,
+)
 
 
 class FakeEnv:
@@ -34,6 +38,26 @@ def test_pick_prompt_all_cooldown_raises():
     cooldown = set(range(100))
     with pytest.raises(RuntimeError, match="no eligible prompt"):
         pick_prompt_idx(env, cooldown_prompts=cooldown, rng=rng)
+
+
+def test_truncate_completion_at_first_eos_in_set():
+    eos_set = {99, 100}
+    tokens = [1, 2, 99, 3, 4, 100]
+    assert truncate_completion_at_eos(tokens, eos_set) == [1, 2, 99]
+    assert truncate_completion_at_eos([1, 2, 3], eos_set) == [1, 2, 3]
+
+
+def test_eos_set_from_generation_config():
+    class GenCfg:
+        eos_token_id = [151645, 151643]
+
+    class Model:
+        generation_config = GenCfg()
+
+    class Tok:
+        eos_token_id = 151645
+
+    assert eos_set_from_model(Model(), Tok()) == {151645, 151643}
 
 
 def test_engine_default_max_new_tokens_is_protocol_cap():

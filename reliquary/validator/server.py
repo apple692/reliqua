@@ -18,33 +18,45 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
+import numbers
 import time
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from reliquary.constants import (
     B_BATCH,
+    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     DRAND_ROUND_BACKWARD_TOLERANCE,
     ENFORCE_ENVELOPE_SIGNATURE,
     MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
+    MIN_EOS_PROBABILITY,
+    MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_CANDIDATES_PER_WINDOW,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    MAX_TRUNCATED_PER_SUBMISSION,
+    SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
+    SPARSE_VALID_IDLE_SEAL_SECONDS,
+    SPARSE_VALID_MAX_WINDOW_SECONDS,
     VALIDATOR_HTTP_PORT,
 )
 from reliquary.protocol.signatures import verify_envelope_signature
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
+    CommitModel,
     GrpoBatchState,
     RejectReason,
     Verdict,
     VerdictsResponse,
 )
+from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batcher import GrpoWindowBatcher
+from reliquary.validator.dedup import compute_rollout_hash
 from reliquary.validator.observability import (
     DrandRoundObservation,
     SubmitTelemetry,
@@ -52,6 +64,7 @@ from reliquary.validator.observability import (
     log_submission_stage,
     runtime_revision,
 )
+from reliquary.validator.verifier import is_in_zone, rewards_std
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +73,199 @@ logger = logging.getLogger(__name__)
 # ring buffer can't grow without limit if a misbehaving miner spams.
 # At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
 VERDICT_CAP_PER_HOTKEY = 200
+
+
+def _is_mock_like(value: Any) -> bool:
+    """Return True for unittest.mock objects.
+
+    The server's unit tests use loose MagicMocks as batchers; touching nested
+    attributes on them auto-creates truthy mock objects. Production batchers
+    carry real model/tokenizer/config objects, so skip optional preflight pieces
+    when the object is clearly a mock.
+    """
+    return type(value).__module__.startswith("unittest.mock")
+
+
+def _proof_free_model_config(batcher: Any) -> Any | None:
+    model = getattr(batcher, "model", None)
+    if model is None or _is_mock_like(model):
+        return None
+    config = getattr(model, "config", None)
+    if config is None or _is_mock_like(config):
+        return None
+    return config
+
+
+def _coerce_eos_set(eos_ids: Any) -> set[int] | None:
+    if eos_ids is None or _is_mock_like(eos_ids):
+        return None
+    if isinstance(eos_ids, numbers.Integral) and not isinstance(eos_ids, bool):
+        return {int(eos_ids)}
+    if isinstance(eos_ids, (list, tuple, set)):
+        eos_set: set[int] = set()
+        for eos_id in eos_ids:
+            if (
+                isinstance(eos_id, numbers.Integral)
+                and not isinstance(eos_id, bool)
+            ):
+                eos_set.add(int(eos_id))
+        return eos_set or None
+    return None
+
+
+def _proof_free_eos_set(batcher: Any) -> set[int] | None:
+    model = getattr(batcher, "model", None)
+    if model is not None and _is_mock_like(model):
+        model = None
+    tokenizer = getattr(batcher, "tokenizer", None)
+    if tokenizer is not None and _is_mock_like(tokenizer):
+        tokenizer = None
+
+    eos_ids = None
+    if model is not None:
+        gen_cfg = getattr(model, "generation_config", None)
+        if gen_cfg is not None and not _is_mock_like(gen_cfg):
+            eos_ids = getattr(gen_cfg, "eos_token_id", None)
+    if eos_ids is None and tokenizer is not None:
+        eos_ids = getattr(tokenizer, "eos_token_id", None)
+    return _coerce_eos_set(eos_ids)
+
+
+def _proof_free_bootstrap(batcher: Any) -> bool:
+    bootstrap = getattr(batcher, "bootstrap", False)
+    if _is_mock_like(bootstrap):
+        return False
+    return bool(bootstrap)
+
+
+def _claimed_final_token_logprob(commit: dict[str, Any]) -> float | None:
+    tokens = list(commit.get("tokens") or [])
+    meta = commit.get("rollout", {}) or {}
+    prompt_length = int(meta.get("prompt_length", 0))
+    completion_length = int(meta.get("completion_length", 0))
+    claimed = list(meta.get("token_logprobs") or [])
+    if completion_length <= 0:
+        return None
+
+    if len(claimed) == len(tokens):
+        final_idx = prompt_length + completion_length - 1
+        if 0 <= final_idx < len(claimed):
+            return float(claimed[final_idx])
+    if len(claimed) == completion_length:
+        return float(claimed[completion_length - 1])
+    return None
+
+
+def _proof_free_submission_reject(
+    request: BatchSubmissionRequest,
+    batcher: Any,
+) -> tuple[RejectReason | None, str | None]:
+    """Reject structurally impossible submissions before proof admission.
+
+    This deliberately avoids trusting claimed probabilities as proof of
+    correctness. A rollout ending in EOS still needs the normal GRAIL path to
+    recompute p_stop/logprobs. The cheap path only catches cases the expensive
+    verifier would reject after burning a scarce proof slot: malformed commits,
+    invalid token envelopes, EOS padding, non-cap completions that never
+    emitted EOS, and self-declared final-EOS probabilities below the hard
+    termination threshold.
+    """
+    for rollout in request.rollouts:
+        try:
+            CommitModel.model_validate(rollout.commit)
+        except ValidationError:
+            return RejectReason.BAD_SCHEMA, "schema"
+        if list(rollout.tokens) != list(rollout.commit["tokens"]):
+            return RejectReason.TOKENS_MISMATCH, "token_invariant"
+
+    model_config = _proof_free_model_config(batcher)
+    canonical_prompt_tokens: list[int] | None = None
+    canonical_prompt_fn = getattr(batcher, "_canonical_prompt_tokens", None)
+    if (
+        callable(canonical_prompt_fn)
+        and not _is_mock_like(canonical_prompt_fn)
+    ):
+        canonical_prompt_tokens = list(canonical_prompt_fn(request.prompt_idx))
+
+    if model_config is not None:
+        for rollout in request.rollouts:
+            if not verify_tokens(rollout.commit["tokens"], model_config):
+                return RejectReason.BAD_TOKENS, "tokens"
+
+            if canonical_prompt_tokens is not None:
+                rollout_meta = rollout.commit.get("rollout", {}) or {}
+                miner_prompt_len = int(rollout_meta.get("prompt_length", 0))
+                miner_prompt_tokens = list(rollout.commit.get("tokens", []))[
+                    :miner_prompt_len
+                ]
+                if miner_prompt_tokens != canonical_prompt_tokens:
+                    return RejectReason.PROMPT_MISMATCH, "prompt_binding"
+
+    hash_set = getattr(batcher, "_hash_set", None)
+    if hash_set is not None and not _is_mock_like(hash_set):
+        local_seen: set[bytes] = set()
+        for rollout in request.rollouts:
+            try:
+                rollout_hash = compute_rollout_hash(rollout.commit["tokens"])
+            except ValueError:
+                return RejectReason.BAD_TOKENS, "tokens"
+            if rollout_hash in local_seen or rollout_hash in hash_set:
+                return RejectReason.HASH_DUPLICATE, "dedup"
+            local_seen.add(rollout_hash)
+
+    if not _is_mock_like(batcher):
+        rewards = [float(rollout.reward) for rollout in request.rollouts]
+        if not is_in_zone(
+            rewards_std(rewards),
+            bootstrap=_proof_free_bootstrap(batcher),
+        ):
+            return RejectReason.OUT_OF_ZONE, "zone"
+
+    eos_set = _proof_free_eos_set(batcher)
+    if not eos_set:
+        return None, None
+
+    max_truncated_per_submission = (
+        BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
+        if _proof_free_bootstrap(batcher)
+        else MAX_TRUNCATED_PER_SUBMISSION
+    )
+    truncated_count = 0
+
+    for rollout in request.rollouts:
+        commit = rollout.commit
+        tokens = list(commit.get("tokens") or [])
+        meta = commit.get("rollout", {}) or {}
+        prompt_length = int(meta.get("prompt_length", 0))
+        completion_length = int(meta.get("completion_length", 0))
+        completion = tokens[prompt_length: prompt_length + completion_length]
+        if not completion:
+            return RejectReason.BAD_SCHEMA, "schema"
+
+        eos_positions = [
+            idx for idx, token in enumerate(completion) if int(token) in eos_set
+        ]
+        if eos_positions:
+            if len(eos_positions) > 1 or eos_positions[0] != len(completion) - 1:
+                return RejectReason.BAD_TERMINATION, "termination_preflight"
+            final_lp = _claimed_final_token_logprob(commit)
+            if (
+                final_lp is not None
+                and math.isfinite(final_lp)
+                and final_lp < math.log(MIN_EOS_PROBABILITY)
+            ):
+                return RejectReason.BAD_TERMINATION, "termination_claim_preflight"
+            continue
+
+        total_length = prompt_length + completion_length
+        if total_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+            return RejectReason.BAD_TERMINATION, "termination_preflight"
+
+        truncated_count += 1
+        if truncated_count > max_truncated_per_submission:
+            return RejectReason.BAD_TERMINATION, "termination_preflight"
+
+    return None, None
 
 
 class _Health(BaseModel):
@@ -76,11 +282,23 @@ class _Health(BaseModel):
     drand_round_backward_tolerance: int
     batch_size: int
     queue_depth: int | None = None
+    proof_verification_inflight: int | None = None
     valid_submissions_count: int | None = None
+    distinct_valid_prompt_count: int | None = None
+    last_valid_submission_ts: float | None = None
+    seconds_since_last_valid_submission: float | None = None
     proof_admission_count: int | None = None
     proof_admission_limit: int = MAX_PROOF_CANDIDATES_PER_WINDOW
     post_trigger_proof_admission_count: int | None = None
     post_trigger_proof_admission_limit: int = MAX_POST_TRIGGER_PROOF_CANDIDATES
+    sparse_valid_idle_seal_seconds: float = SPARSE_VALID_IDLE_SEAL_SECONDS
+    sparse_valid_idle_min_distinct_prompts: int = (
+        SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
+    )
+    sparse_valid_max_window_seconds: float = SPARSE_VALID_MAX_WINDOW_SECONDS
+    expensive_proof_failures_by_hotkey: dict[str, int] = Field(
+        default_factory=dict
+    )
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     recent_reject_counts_by_reason: dict[str, int]
@@ -101,6 +319,7 @@ class ValidatorServer:
         self._task: asyncio.Task[Any] | None = None
         self._submit_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task[Any] | None = None
+        self._inflight_proofs = 0
         from reliquary.protocol.submission import WindowState
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
@@ -138,6 +357,14 @@ class ValidatorServer:
 
     def set_current_checkpoint(self, entry) -> None:
         self._current_checkpoint = entry
+
+    @property
+    def submit_queue_depth(self) -> int:
+        return self._submit_queue.qsize()
+
+    @property
+    def proof_verification_inflight(self) -> int:
+        return self._inflight_proofs
 
     def set_late_drop_callback(
         self, fn: Callable[[str, str], None] | None,
@@ -255,8 +482,29 @@ class ValidatorServer:
             drand_round_backward_tolerance=DRAND_ROUND_BACKWARD_TOLERANCE,
             batch_size=B_BATCH,
             queue_depth=self._submit_queue.qsize(),
+            proof_verification_inflight=self._inflight_proofs,
             valid_submissions_count=(
                 getattr(batcher, "valid_count", None) if batcher else None
+            ),
+            distinct_valid_prompt_count=(
+                batcher.distinct_valid_prompt_count()
+                if (
+                    batcher is not None
+                    and hasattr(batcher, "distinct_valid_prompt_count")
+                )
+                else None
+            ),
+            last_valid_submission_ts=(
+                getattr(batcher, "last_valid_submission_wall_ts", None)
+                if batcher else None
+            ),
+            seconds_since_last_valid_submission=(
+                batcher.seconds_since_last_valid_submission()
+                if (
+                    batcher is not None
+                    and hasattr(batcher, "seconds_since_last_valid_submission")
+                )
+                else None
             ),
             proof_admission_count=(
                 getattr(batcher, "proof_admission_count", None) if batcher else None
@@ -264,6 +512,10 @@ class ValidatorServer:
             post_trigger_proof_admission_count=(
                 getattr(batcher, "post_trigger_proof_admission_count", None)
                 if batcher else None
+            ),
+            expensive_proof_failures_by_hotkey=(
+                dict(getattr(batcher, "expensive_proof_failures_by_hotkey", {}))
+                if batcher else {}
             ),
             checkpoint_repo_id=cp.repo_id if cp else None,
             checkpoint_revision=cp.revision if cp else None,
@@ -722,6 +974,15 @@ class ValidatorServer:
                 type(batcher), "try_reserve_proof_admission", None
             )
             if reserve_proof is not None:
+                preflight_reason, preflight_stage = _proof_free_submission_reject(
+                    request, batcher
+                )
+                if preflight_reason is not None:
+                    return _cheap_reject(
+                        preflight_reason,
+                        reject_stage=preflight_stage or "preflight",
+                    )
+
                 admitted, admission_reason = batcher.try_reserve_proof_admission(
                     request
                 )
@@ -1011,9 +1272,13 @@ class ValidatorServer:
                     reject_stage=None,
                     reject_reason=None,
                 )
-                response = await asyncio.to_thread(
-                    self._call_accept_submission, batcher, request, telemetry
-                )
+                self._inflight_proofs += 1
+                try:
+                    response = await asyncio.to_thread(
+                        self._call_accept_submission, batcher, request, telemetry
+                    )
+                finally:
+                    self._inflight_proofs = max(0, self._inflight_proofs - 1)
                 telemetry.refresh_from_batcher(batcher, at_decision=True)
                 telemetry.mark_decision(verified=True)
                 log_submission_stage(

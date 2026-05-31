@@ -23,6 +23,17 @@ def setup_logging(level: str = "INFO"):
         format="%(asctime)s | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # HTTP client libraries log every request at INFO — far too noisy for miners.
+    for _logger in (
+        "httpx",
+        "httpcore",
+        "httpcore.http11",
+        "httpcore.connection",
+        "urllib3",
+        "urllib3.connectionpool",
+        "huggingface_hub",
+    ):
+        logging.getLogger(_logger).setLevel(logging.WARNING)
 
 
 @app.command()
@@ -43,6 +54,28 @@ def mine(
             "Override the validator URL (otherwise discovered from the metagraph). "
             "Useful for local testing — e.g. http://127.0.0.1:8888"
         ),
+    ),
+    use_vllm: bool = typer.Option(
+        False,
+        "--use-vllm/--no-use-vllm",
+        help=(
+            "Use vLLM on cuda:0 for generation (~3-5× HF throughput). "
+            "Requires ``pip install vllm`` and reasonable VRAM headroom. "
+            "GRAIL proofs still run on cuda:1 against the HF model."
+        ),
+    ),
+    sigma_predictor: bool = typer.Option(
+        True,
+        "--sigma-predictor/--no-sigma-predictor",
+        help=(
+            "Use Beta-Bernoulli σ-predictor to bias prompt selection toward "
+            "buckets with high posterior yield. Cold-start = uniform random; "
+            "learns as bucket evidence accumulates."
+        ),
+    ),
+    sigma_predictor_path: str = typer.Option(
+        os.path.expanduser("~/.reliquary/sigma_predictor.json"),
+        help="Path to persist σ-predictor state (loaded on start, saved periodically).",
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
@@ -68,6 +101,13 @@ def mine(
         from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
         from reliquary.miner.engine import MiningEngine
         from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
+        from reliquary.shared.hf_compat import resolve_attn_implementation
+
+        attn_impl = resolve_attn_implementation()
+        if attn_impl != ATTN_IMPLEMENTATION:
+            logger.info("Using attn_implementation=%s (requested %s)", attn_impl, ATTN_IMPLEMENTATION)
+        else:
+            logger.info("Using attn_implementation=%s", attn_impl)
 
         wallet = bt.Wallet(name=wallet_name, hotkey=hotkey)
         subtensor = await get_subtensor()
@@ -110,6 +150,12 @@ def mine(
             )
 
         # --- Load models from resolved path ---
+        # Apply transformers compat patches BEFORE tokenizer load — some
+        # checkpoints (R0mAI/reliquary-sn-v23) ship tokenizer_config.json with
+        # legacy list-form ``extra_special_tokens`` that crashes 4.57+.
+        from reliquary.miner.generation import apply_transformers_compat_patches
+        apply_transformers_compat_patches()
+
         logger.info("Loading models from %s...", initial_path)
         tokenizer = AutoTokenizer.from_pretrained(initial_path)
         if tokenizer.pad_token_id is None:
@@ -131,19 +177,60 @@ def mine(
                 n_gpu, gen_device,
             )
 
-        vllm_model = AutoModelForCausalLM.from_pretrained(
-            initial_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=ATTN_IMPLEMENTATION,
-        ).to(gen_device).eval()
-
+        # GRAIL proof model: HF on cuda:1 (always — required for validator bit-identicality).
         hf_model = AutoModelForCausalLM.from_pretrained(
             initial_path,
             torch_dtype=torch.bfloat16,
-            attn_implementation=ATTN_IMPLEMENTATION,
+            attn_implementation=attn_impl,
         ).to(proof_device).eval()
 
+        gen_backend = None
+        vllm_model = None
+        if use_vllm:
+            try:
+                from reliquary.miner.generation import build_vllm_generator
+                gen_backend = build_vllm_generator(
+                    initial_path,
+                    gpu=0 if gen_device == "cuda:0" else int(gen_device.split(":")[-1]),
+                )
+                logger.info("vLLM generation backend ready")
+            except Exception as e:
+                logger.error(
+                    "Could not initialise vLLM (%s); falling back to HF generation. "
+                    "Install vLLM with `pip install vllm` to enable.",
+                    e, exc_info=True,
+                )
+                gen_backend = None
+
+        if gen_backend is None:
+            vllm_model = AutoModelForCausalLM.from_pretrained(
+                initial_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=attn_impl,
+            ).to(gen_device).eval()
+
         env = load_environment(environment)
+
+        # σ-predictor: load persisted state if present; otherwise fresh.
+        predictor = None
+        if sigma_predictor:
+            from reliquary.miner.sigma_predictor import BetaBucketPredictor
+            if os.path.exists(sigma_predictor_path):
+                try:
+                    predictor = BetaBucketPredictor.load(sigma_predictor_path)
+                    logger.info(
+                        "Loaded σ-predictor from %s (%s)",
+                        sigma_predictor_path, predictor.stats_line(),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to load σ-predictor from %s (%s); starting fresh",
+                        sigma_predictor_path, e,
+                    )
+                    predictor = BetaBucketPredictor()
+            else:
+                predictor = BetaBucketPredictor()
+
         engine = MiningEngine(
             vllm_model,
             hf_model,
@@ -153,6 +240,10 @@ def mine(
             vllm_gpu=0 if gen_device == "cuda:0" else int(gen_device.split(":")[-1]),
             proof_gpu=0 if proof_device == "cuda:0" else int(proof_device.split(":")[-1]),
             validator_url_override=validator_url or None,
+            gen_backend=gen_backend,
+            predictor=predictor,
+            predictor_save_path=sigma_predictor_path if sigma_predictor else None,
+            attn_implementation=attn_impl,
         )
 
         # Seed engine's _loaded_checkpoint_path so the first

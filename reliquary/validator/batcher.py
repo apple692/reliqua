@@ -19,6 +19,7 @@ from reliquary.constants import (
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     M_ROLLOUTS,
+    MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_POST_TRIGGER_PROOF_CANDIDATES,
     MAX_PROOF_CANDIDATES_PER_WINDOW,
@@ -51,6 +52,7 @@ from reliquary.validator.observability import (
     log_submission_stage,
 )
 from reliquary.validator.boxed_integrity import has_malformed_final_answer
+from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_boxed_answer_probability,
@@ -65,6 +67,17 @@ from reliquary.validator.verifier import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PROOF_FAILURE_DEBT_STAGES = frozenset(
+    {
+        "grail",
+        "termination",
+        "logprob",
+        "distribution",
+        "boxed_answer",
+        "reward_shape",
+    }
+)
 
 
 # v2.3: batch selection is drand-anchored at seal time (see
@@ -106,6 +119,9 @@ class ValidSubmission:
     drand_delta: int | None = None
     seal_trigger_round: int | None = None
     prompt_hash_lead: str | None = None
+    reward_vector: str = ""
+    truncated_count: int = 0
+    reward_shape: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -212,6 +228,8 @@ class GrpoWindowBatcher:
         self.window_opened_at: float = self._time_fn()
         self.window_opened_wall_ts: float = self._wall_clock()
         self.window_open_drand_round: int | None = None
+        self.last_valid_submission_at: float | None = None
+        self.last_valid_submission_wall_ts: float | None = None
 
         self._cooldown = (
             cooldown_map if cooldown_map is not None
@@ -308,6 +326,7 @@ class GrpoWindowBatcher:
         # trigger-round submissions get a short chance to finish GRAIL
         # before the batch is sealed.
         self._queue_drained_predicate = queue_drained_predicate
+        self.force_seal_reason: str | None = None
         # Proof-admission accounting is separate from ``_lock`` because the
         # submit worker holds ``_lock`` during GRAIL. The HTTP cheap path must
         # be able to reject over-budget submissions without waiting behind the
@@ -316,6 +335,7 @@ class GrpoWindowBatcher:
         self._proof_admission_lock = threading.Lock()
         self._proof_admission_count = 0
         self._post_trigger_proof_admission_count = 0
+        self._expensive_proof_failures_by_hotkey: dict[str, int] = {}
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -353,6 +373,21 @@ class GrpoWindowBatcher:
         """
         return self._seal_flag.is_set()
 
+    def force_seal(self, reason: str) -> None:
+        """Force this window to seal without B distinct valid submissions.
+
+        Used only as a liveness breaker after the bounded proof-admission
+        queue has fully drained and no further expensive submissions can be
+        admitted. The downstream training path already skips partial batches;
+        this just avoids waiting for the long window timeout.
+        """
+        if self._seal_flag.is_set():
+            return
+        self.force_seal_reason = reason
+        self._seal_flag.set()
+        if self._seal_event is not None:
+            self._seal_event.set()
+
     def prompt_submission_count(self, prompt_idx: int) -> int:
         """Number of GRAIL-validated submissions already in the per-prompt
         bucket for ``prompt_idx``. Used by the HTTP /submit handler to
@@ -365,6 +400,24 @@ class GrpoWindowBatcher:
         """
         return len(self._submissions_per_prompt.get(prompt_idx, ()))
 
+    def distinct_valid_prompt_count(self) -> int:
+        """Number of distinct, non-cooldown prompts among valid submissions.
+
+        This is the trainable fill level for the window. It can be lower than
+        ``valid_count`` when multiple miners submit the same prompt, so seal
+        liveness must reason about this value instead of raw submissions.
+        """
+        return len({
+            s.prompt_idx for s in list(self._valid)
+            if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
+        })
+
+    def seconds_since_last_valid_submission(self) -> float | None:
+        """Seconds since the last accepted valid submission, or None."""
+        if self.last_valid_submission_at is None:
+            return None
+        return max(0.0, self._time_fn() - self.last_valid_submission_at)
+
     @property
     def proof_admission_count(self) -> int:
         """Number of submissions admitted to the expensive proof path."""
@@ -374,6 +427,14 @@ class GrpoWindowBatcher:
     def post_trigger_proof_admission_count(self) -> int:
         """Number of proof-path reservations after the seal trigger round."""
         return self._post_trigger_proof_admission_count
+
+    @property
+    def expensive_proof_failures_by_hotkey(self) -> dict[str, int]:
+        """Per-window count of hotkey failures after entering proof path."""
+        return dict(self._expensive_proof_failures_by_hotkey)
+
+    def proof_failure_debt(self, hotkey: str) -> int:
+        return self._expensive_proof_failures_by_hotkey.get(hotkey, 0)
 
     def try_reserve_proof_admission(
         self,
@@ -386,6 +447,14 @@ class GrpoWindowBatcher:
         failed attempts would make invalid proof traffic free again.
         """
         with self._proof_admission_lock:
+            if (
+                self._expensive_proof_failures_by_hotkey.get(
+                    request.miner_hotkey, 0
+                )
+                >= MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+            ):
+                return False, "proof_failure_debt_hotkey"
+
             if self._proof_admission_count >= MAX_PROOF_CANDIDATES_PER_WINDOW:
                 return False, "proof_admission_window_full"
 
@@ -638,6 +707,19 @@ class GrpoWindowBatcher:
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
 
         rewards = [float(r.reward) for r in request.rollouts]
+        completion_lengths = []
+        for rollout in request.rollouts:
+            rollout_meta = (rollout.commit or {}).get("rollout", {}) or {}
+            prompt_len = int(rollout_meta.get("prompt_length", 0) or 0)
+            completion_lengths.append(
+                int(
+                    rollout_meta.get(
+                        "completion_length",
+                        max(0, len(rollout.commit.get("tokens", [])) - prompt_len),
+                    )
+                    or 0
+                )
+            )
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
@@ -678,17 +760,18 @@ class GrpoWindowBatcher:
         lp_dev_max: float | None = None
         dist_q10_min: float | None = None
 
-        # Steady-state training should not ingest cap/non-EOS truncated
-        # completions. Bootstrap keeps a one-rollout allowance to preserve
-        # early-window fill rate while the model is weak.
+        # Cap/non-EOS truncation is tolerated only as a rare one-rollout
+        # accident. Multiple missing-EOS rollouts in the same group are a
+        # sampling policy and make weak loser slots too easy to manufacture.
         max_truncated_per_submission = (
             BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
             if self.bootstrap
             else MAX_TRUNCATED_PER_SUBMISSION
         )
         truncated_count = 0
+        truncated_flags = [False] * len(request.rollouts)
 
-        for rollout in request.rollouts:
+        for rollout_idx, rollout in enumerate(request.rollouts):
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
             # Randomness binding: the miner-claimed beacon randomness MUST equal
@@ -747,6 +830,7 @@ class GrpoWindowBatcher:
                     rollout.commit, self.tokenizer, proof, self.model
                 )
                 if not termination_ok or cap_truncated:
+                    truncated_flags[rollout_idx] = True
                     truncated_count += 1
                     if truncated_count > max_truncated_per_submission:
                         return reject(
@@ -834,6 +918,25 @@ class GrpoWindowBatcher:
                     dist_q10_min=dist_q10_min,
                 )
 
+        reward_shape = detect_reward_shape_manipulation(
+            rewards,
+            completion_lengths,
+            truncated_flags,
+        )
+        if reward_shape.suspicious:
+            logger.info(
+                "reject reason=reward_shape_suspicious hotkey=%s %s",
+                request.miner_hotkey,
+                reward_shape.to_log_dict(),
+            )
+            return reject(
+                RejectReason.REWARD_SHAPE_SUSPICIOUS,
+                "reward_shape",
+                sketch_diff_max=sketch_diff_max,
+                lp_dev_max=lp_dev_max,
+                dist_q10_min=dist_q10_min,
+            )
+
         # All checks passed — append to both the flat list and the per-prompt
         # bucket. The bucket is what seal_batch groups over.
         new_sub = ValidSubmission(
@@ -859,19 +962,21 @@ class GrpoWindowBatcher:
             drand_delta=telemetry.drand_delta if telemetry else None,
             seal_trigger_round=self._seal_trigger_round,
             prompt_hash_lead=telemetry.prompt_hash_lead if telemetry else None,
+            reward_vector=reward_shape.reward_vector,
+            truncated_count=truncated_count,
+            reward_shape=reward_shape.to_log_dict(),
         )
         self._valid.append(new_sub)
         self._submissions_per_prompt.setdefault(
             request.prompt_idx, []
         ).append(new_sub)
+        self.last_valid_submission_at = self._time_fn()
+        self.last_valid_submission_wall_ts = self._wall_clock()
         # Lock-free read in /state — see ``__init__`` for rationale.
         self.valid_count = len(self._valid)
 
         # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
-        distinct_eligible = len({
-            s.prompt_idx for s in self._valid
-            if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
-        })
+        distinct_eligible = self.distinct_valid_prompt_count()
         if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
             # B-th distinct prompt just landed. Record the trigger drand
             # round and DELAY the actual seal until the round expires —
@@ -1000,6 +1105,15 @@ class GrpoWindowBatcher:
         reject_stage: str | None = None,
     ) -> BatchSubmissionResponse:
         self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
+
+        if (
+            hotkey is not None
+            and reject_stage in _PROOF_FAILURE_DEBT_STAGES
+        ):
+            with self._proof_admission_lock:
+                self._expensive_proof_failures_by_hotkey[hotkey] = (
+                    self._expensive_proof_failures_by_hotkey.get(hotkey, 0) + 1
+                )
 
         if hotkey is not None and prompt_idx is not None:
             already = sum(
